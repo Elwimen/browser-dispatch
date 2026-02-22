@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""Browser Dispatch - Route URLs to browsers based on domain rules."""
+
+# =============================================================================
+# BOOTSTRAP — must be at the very top, before any third-party imports
+# =============================================================================
+from pathlib import Path
+import sys
+import os
+
+SCRIPT_FILE = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_FILE.parent
+VENV_DIR = SCRIPT_DIR / ".venv"
+VENV_PYTHON = VENV_DIR / "bin" / "python3"
+
+# Check via sys.prefix: venvs set this to the venv directory, not the system prefix.
+# Comparing resolved executable paths is unreliable because venv python3 is often a
+# symlink to the same underlying binary as the system python3.
+if Path(sys.prefix) != VENV_DIR:
+    import subprocess
+
+    if not VENV_PYTHON.exists():
+        print("Browser Dispatch: setting up virtual environment...", flush=True)
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(SCRIPT_DIR / ".venv")],
+            check=True,
+        )
+        # Ensure pip is available, then install dependencies
+        subprocess.run(
+            [str(VENV_PYTHON), "-m", "ensurepip", "--upgrade"],
+            check=False,
+            capture_output=True,
+        )
+        subprocess.run(
+            [str(VENV_PYTHON), "-m", "pip", "install", "--upgrade", "pip", "-q"],
+            check=False,
+            capture_output=True,
+        )
+        print("Installing textual...", flush=True)
+        subprocess.run(
+            [str(VENV_PYTHON), "-m", "pip", "install", "textual", "-q"],
+            check=True,
+        )
+        print("Setup complete. Launching...", flush=True)
+
+    os.execv(
+        str(VENV_PYTHON),
+        [str(VENV_PYTHON), str(SCRIPT_FILE)] + sys.argv[1:],
+    )
+
+# =============================================================================
+# IMPORTS — now running inside the venv
+# =============================================================================
+import json
+import re
+import fnmatch
+import subprocess
+import configparser
+from urllib.parse import urlparse
+from typing import Optional
+
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Select,
+    Static,
+)
+
+# =============================================================================
+# PATHS & CONSTANTS
+# =============================================================================
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+XDG_DATA_HOME = Path(
+    os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
+)
+CONFIG_DIR = XDG_CONFIG_HOME / "browser-dispatch"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+DESKTOP_FILE_PATH = XDG_DATA_HOME / "applications" / "browser-dispatch.desktop"
+MIMEAPPS_PATH = XDG_CONFIG_HOME / "mimeapps.list"
+
+# =============================================================================
+# CONFIG MANAGEMENT
+# =============================================================================
+
+DEFAULT_CONFIG: dict = {
+    "default_browser": "",
+    "previous_default": "",
+    "rules": [],
+}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+            for k, v in DEFAULT_CONFIG.items():
+                data.setdefault(k, v)
+            return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return DEFAULT_CONFIG.copy()
+
+
+def save_config(config: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+# =============================================================================
+# BROWSER DETECTION
+# =============================================================================
+
+def _parse_exec(exec_str: str) -> list[str]:
+    """Parse Exec field, removing %u/%U/%f/%F field codes."""
+    parts = exec_str.split()
+    return [p for p in parts if not (len(p) == 2 and p.startswith("%"))]
+
+
+def _parse_desktop_file(path: Path) -> Optional[dict]:
+    """Parse a .desktop file; return browser info dict or None if not a browser."""
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str  # preserve case
+    try:
+        cp.read(str(path), encoding="utf-8")
+    except Exception:
+        return None
+
+    if not cp.has_section("Desktop Entry"):
+        return None
+
+    entry = cp["Desktop Entry"]
+    name = entry.get("Name", "").strip()
+
+    # Skip our own dispatcher
+    if name == "Browser Dispatch":
+        return None
+
+    # Skip hidden / NoDisplay entries that aren't browsers
+    no_display = entry.get("NoDisplay", "false").strip().lower()
+    categories = entry.get("Categories", "")
+    mime_type = entry.get("MimeType", "")
+
+    # Require x-scheme-handler/http in MimeType — this is the definitive indicator
+    # that an app can actually open URLs. WebBrowser in Categories alone is not
+    # reliable (e.g. KDE's bookmark editor also has it but doesn't handle URLs).
+    if "x-scheme-handler/http" not in mime_type:
+        return None
+
+    exec_str = entry.get("Exec", "").strip()
+    exec_parts = _parse_exec(exec_str)
+    if not exec_parts:
+        return None
+
+    return {
+        "name": name,
+        "exec": exec_parts[0],
+        "exec_args": exec_parts,
+        "desktop_file": path.name,
+    }
+
+
+def detect_browsers() -> dict[str, dict]:
+    """Return dict of {display_name: browser_info} for all detected browsers."""
+    search_dirs = [
+        Path("/usr/share/applications"),
+        XDG_DATA_HOME / "applications",
+    ]
+    browsers: dict[str, dict] = {}
+    seen_desktops: set[str] = set()
+
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for desktop_file in sorted(search_dir.glob("*.desktop")):
+            if desktop_file.name in seen_desktops:
+                continue
+            info = _parse_desktop_file(desktop_file)
+            if info:
+                browsers[info["name"]] = info
+                seen_desktops.add(desktop_file.name)
+
+    return browsers
+
+
+# =============================================================================
+# RULE MATCHING
+# =============================================================================
+
+def match_url(url: str, config: dict) -> tuple[str, Optional[dict]]:
+    """
+    Match URL against rules in order. Returns (browser_name, matched_rule | None).
+    Falls back to default_browser if no rule matches.
+    """
+    try:
+        hostname = urlparse(url).hostname or ""
+    except Exception:
+        hostname = ""
+
+    for rule in config.get("rules", []):
+        pattern = rule.get("pattern", "")
+        rule_type = rule.get("type", "glob")
+        matched = False
+
+        if rule_type == "glob":
+            matched = fnmatch.fnmatch(hostname, pattern)
+        elif rule_type == "regex":
+            try:
+                matched = bool(re.search(pattern, hostname))
+            except re.error:
+                pass
+
+        if matched:
+            return rule.get("browser", ""), rule
+
+    return config.get("default_browser", ""), None
+
+
+# =============================================================================
+# DISPATCHER
+# =============================================================================
+
+def dispatch(url: str) -> None:
+    """Route a URL to the appropriate browser based on configured rules."""
+    config = load_config()
+    browser_name, _ = match_url(url, config)
+    browsers = detect_browsers()
+
+    cmd: list[str] = []
+
+    if browser_name and browser_name in browsers:
+        cmd = browsers[browser_name]["exec_args"] + [url]
+    elif browser_name:
+        # Try as a bare command (e.g. "firefox")
+        cmd = [browser_name, url]
+    else:
+        print(
+            f"browser-dispatch: no browser configured. Set a default in --config.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    subprocess.Popen(cmd)
+
+
+# =============================================================================
+# INSTALLER
+# =============================================================================
+
+def is_installed() -> bool:
+    return DESKTOP_FILE_PATH.exists()
+
+
+def _read_mimeapps() -> configparser.RawConfigParser:
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str
+    if MIMEAPPS_PATH.exists():
+        cp.read(str(MIMEAPPS_PATH), encoding="utf-8")
+    return cp
+
+
+def _write_mimeapps(cp: configparser.RawConfigParser) -> None:
+    MIMEAPPS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(MIMEAPPS_PATH, "w") as f:
+        cp.write(f)
+
+
+def get_current_default() -> str:
+    cp = _read_mimeapps()
+    if cp.has_section("Default Applications"):
+        handler = cp["Default Applications"].get("x-scheme-handler/http", "")
+        return handler.strip().rstrip(";")
+    return ""
+
+
+def install_as_default() -> None:
+    config = load_config()
+
+    # Save previous default so we can restore it
+    current = get_current_default()
+    if current and current != "browser-dispatch.desktop":
+        config["previous_default"] = current
+        save_config(config)
+
+    # Write .desktop file
+    DESKTOP_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    desktop_content = (
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        "Name=Browser Dispatch\n"
+        "GenericName=Web Browser Dispatcher\n"
+        f"Exec={SCRIPT_FILE} %u\n"
+        "Terminal=false\n"
+        "NoDisplay=true\n"
+        "MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/ftp;\n"
+        "StartupNotify=false\n"
+    )
+    DESKTOP_FILE_PATH.write_text(desktop_content)
+
+    # Update mimeapps.list
+    cp = _read_mimeapps()
+    if not cp.has_section("Default Applications"):
+        cp.add_section("Default Applications")
+    for scheme in ("x-scheme-handler/http", "x-scheme-handler/https"):
+        cp["Default Applications"][scheme] = "browser-dispatch.desktop"
+    _write_mimeapps(cp)
+
+    # Update desktop database and xdg-settings (best-effort)
+    for cmd in (
+        ["update-desktop-database", str(XDG_DATA_HOME / "applications")],
+        ["xdg-settings", "set", "default-web-browser", "browser-dispatch.desktop"],
+    ):
+        try:
+            subprocess.run(cmd, check=False, capture_output=True)
+        except FileNotFoundError:
+            pass
+
+
+def uninstall_as_default() -> None:
+    config = load_config()
+    previous = config.get("previous_default", "")
+
+    # Remove desktop file
+    if DESKTOP_FILE_PATH.exists():
+        DESKTOP_FILE_PATH.unlink()
+
+    # Restore or clear mimeapps entries
+    cp = _read_mimeapps()
+    if not cp.has_section("Default Applications"):
+        cp.add_section("Default Applications")
+
+    if previous:
+        for scheme in ("x-scheme-handler/http", "x-scheme-handler/https"):
+            cp["Default Applications"][scheme] = previous
+        try:
+            subprocess.run(
+                ["xdg-settings", "set", "default-web-browser", previous],
+                check=False,
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            pass
+    else:
+        for scheme in ("x-scheme-handler/http", "x-scheme-handler/https"):
+            if cp.has_option("Default Applications", scheme):
+                val = cp["Default Applications"][scheme].strip().rstrip(";")
+                if val == "browser-dispatch.desktop":
+                    cp.remove_option("Default Applications", scheme)
+
+    _write_mimeapps(cp)
+
+    # Update desktop database
+    try:
+        subprocess.run(
+            ["update-desktop-database", str(XDG_DATA_HOME / "applications")],
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+
+
+# =============================================================================
+# TUI — MODAL SCREENS
+# =============================================================================
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Simple yes/no confirmation dialog."""
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen > Container {
+        width: 52;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    ConfirmScreen #confirm-buttons {
+        margin-top: 1;
+        height: auto;
+    }
+    ConfirmScreen Button {
+        margin-right: 1;
+    }
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Label(self.message)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Yes", variant="error", id="yes-btn")
+                yield Button("No", variant="primary", id="no-btn")
+
+    @on(Button.Pressed, "#yes-btn")
+    def confirm_yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#no-btn")
+    def confirm_no(self) -> None:
+        self.dismiss(False)
+
+
+class RuleEditScreen(ModalScreen[Optional[dict]]):
+    """Add or edit a dispatch rule."""
+
+    DEFAULT_CSS = """
+    RuleEditScreen {
+        align: center middle;
+    }
+    RuleEditScreen > Container {
+        width: 64;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    RuleEditScreen Label {
+        margin-top: 1;
+    }
+    RuleEditScreen Input {
+        margin-top: 0;
+    }
+    RuleEditScreen Select {
+        margin-top: 0;
+    }
+    RuleEditScreen #edit-buttons {
+        margin-top: 1;
+        height: auto;
+    }
+    RuleEditScreen Button {
+        margin-right: 1;
+    }
+    RuleEditScreen #help-text {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, rule: Optional[dict] = None, browsers: Optional[dict] = None) -> None:
+        super().__init__()
+        self.rule = rule or {}
+        self.browsers = browsers or {}
+
+    def compose(self) -> ComposeResult:
+        browser_opts = [(name, name) for name in sorted(self.browsers.keys())]
+        type_opts = [
+            ("Glob  — wildcards like *.example.com", "glob"),
+            ("Regex — full regular expressions", "regex"),
+        ]
+        current_type = self.rule.get("type", "glob")
+        current_browser = self.rule.get("browser", browser_opts[0][1] if browser_opts else None)
+
+        with Container():
+            yield Label("Pattern:")
+            yield Input(
+                value=self.rule.get("pattern", ""),
+                placeholder="*.example.com  or  ^mail\\.google\\.com$",
+                id="pattern-input",
+            )
+            yield Static(
+                "Glob: use * as wildcard (*.google.com matches mail.google.com)\n"
+                "Regex: matched against the hostname with re.search()",
+                id="help-text",
+            )
+            yield Label("Pattern type:")
+            yield Select(type_opts, value=current_type, id="type-select", allow_blank=False)
+            yield Label("Route to browser:")
+            if browser_opts:
+                yield Select(browser_opts, value=current_browser, id="browser-select", allow_blank=False)
+            else:
+                yield Static("[red]No browsers detected.[/red]")
+            with Horizontal(id="edit-buttons"):
+                yield Button("Save", variant="primary", id="save-btn")
+                yield Button("Cancel", id="cancel-btn")
+
+    @on(Button.Pressed, "#cancel-btn")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#save-btn")
+    def save(self) -> None:
+        pattern = self.query_one("#pattern-input", Input).value.strip()
+        if not pattern:
+            self.query_one("#pattern-input", Input).focus()
+            return
+
+        type_select = self.query_one("#type-select", Select)
+        rule_type = str(type_select.value) if type_select.value is not Select.BLANK else "glob"
+
+        try:
+            browser_select = self.query_one("#browser-select", Select)
+            browser = str(browser_select.value) if browser_select.value is not Select.BLANK else ""
+        except Exception:
+            browser = ""
+
+        if not browser:
+            return
+
+        # Validate regex if applicable
+        if rule_type == "regex":
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                self.notify(f"Invalid regex: {e}", severity="error")
+                return
+
+        self.dismiss({"pattern": pattern, "type": rule_type, "browser": browser})
+
+
+class TestURLScreen(ModalScreen[None]):
+    """Test URL routing interactively."""
+
+    DEFAULT_CSS = """
+    TestURLScreen {
+        align: center middle;
+    }
+    TestURLScreen > Container {
+        width: 64;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+        padding: 1 2;
+    }
+    TestURLScreen #result {
+        margin-top: 1;
+        padding: 1;
+        background: $boost;
+        min-height: 3;
+    }
+    TestURLScreen #close-btn {
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, config: dict, browsers: dict) -> None:
+        super().__init__()
+        self._config = config
+        self._browsers = browsers
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Label("Test URL Routing")
+            yield Label("Enter a URL to see which browser would handle it:")
+            yield Input(placeholder="https://mail.google.com", id="url-input")
+            yield Static("", id="result")
+            yield Button("Close", id="close-btn")
+
+    def on_mount(self) -> None:
+        self.query_one("#url-input", Input).focus()
+
+    @on(Input.Changed, "#url-input")
+    def on_url_changed(self, event: Input.Changed) -> None:
+        url = event.value.strip()
+        result = self.query_one("#result", Static)
+
+        if not url:
+            result.update("")
+            return
+
+        if not url.startswith(("http://", "https://", "ftp://")):
+            url = "https://" + url
+
+        browser_name, matched_rule = match_url(url, self._config)
+        try:
+            hostname = urlparse(url).hostname or url
+        except Exception:
+            hostname = url
+
+        if matched_rule:
+            result.update(
+                f"[bold green]→ {browser_name}[/bold green]\n"
+                f"  Hostname: {hostname}\n"
+                f"  Matched rule: [italic]{matched_rule['pattern']}[/italic] ({matched_rule['type']})"
+            )
+        elif browser_name:
+            result.update(
+                f"[bold yellow]→ {browser_name}[/bold yellow]  (default)\n"
+                f"  Hostname: {hostname}\n"
+                f"  No rules matched — using default browser"
+            )
+        else:
+            result.update("[bold red]→ No browser configured![/bold red]\n  Set a default browser.")
+
+    @on(Button.Pressed, "#close-btn")
+    def close(self) -> None:
+        self.dismiss(None)
+
+
+# =============================================================================
+# TUI — MAIN APP
+# =============================================================================
+
+class BrowserDispatchApp(App):
+    TITLE = "Browser Dispatch"
+    SUB_TITLE = "Route URLs to browsers by domain rules"
+
+    DEFAULT_CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #main {
+        layout: vertical;
+        padding: 1 2;
+    }
+    #rules-header {
+        text-style: bold;
+        margin-bottom: 0;
+    }
+    #rules-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    DataTable {
+        height: 1fr;
+        border: solid $primary;
+    }
+    #bottom {
+        layout: horizontal;
+        height: auto;
+        margin-top: 1;
+        padding-top: 1;
+        border-top: solid $primary-darken-2;
+    }
+    #default-section {
+        width: 1fr;
+        layout: vertical;
+        height: auto;
+    }
+    #default-section Label {
+        text-style: bold;
+    }
+    #default-select {
+        width: 36;
+    }
+    #status-section {
+        width: 1fr;
+        layout: vertical;
+        height: auto;
+        align: right top;
+    }
+    #status-label {
+        text-align: right;
+    }
+    """
+
+    BINDINGS = [
+        Binding("a", "add_rule", "Add rule"),
+        Binding("e", "edit_rule", "Edit rule"),
+        Binding("d", "delete_rule", "Delete rule"),
+        Binding("ctrl+up", "move_up", "Move up"),
+        Binding("ctrl+down", "move_down", "Move down"),
+        Binding("t", "test_url", "Test URL"),
+        Binding("i", "install", "Install"),
+        Binding("u", "uninstall", "Uninstall"),
+        Binding("q", "quit_app", "Quit"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = load_config()
+        self.browsers = detect_browsers()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="main"):
+            yield Label("Rules  —  first match wins", id="rules-header")
+            yield Label("Ctrl+↑/↓ to reorder  ·  a=add  e=edit  d=delete  t=test  i=install  u=uninstall", id="rules-hint")
+            yield DataTable(id="rules-table", zebra_stripes=True, cursor_type="row")
+            with Horizontal(id="bottom"):
+                with Vertical(id="default-section"):
+                    yield Label("Default browser (fallback):")
+                    browser_opts = self._browser_opts()
+                    valid_names = {v for _, v in browser_opts}
+                    saved = self.config.get("default_browser", "")
+                    default_val = saved if saved in valid_names else (
+                        browser_opts[0][1] if browser_opts else Select.BLANK
+                    )
+                    yield Select(
+                        browser_opts,
+                        value=default_val,
+                        id="default-select",
+                        allow_blank=True,
+                    )
+                with Vertical(id="status-section"):
+                    yield Static(self._status_text(), id="status-label")
+        yield Footer()
+
+    def _browser_opts(self) -> list[tuple[str, str]]:
+        return [(name, name) for name in sorted(self.browsers.keys())]
+
+    def _status_text(self) -> str:
+        if is_installed():
+            return "[green]● Installed as default browser[/green]"
+        return "[yellow]○ Not installed as default browser[/yellow]"
+
+    def on_mount(self) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        table.add_columns("#", "Pattern", "Type", "Browser")
+        self._refresh_table()
+
+    def _refresh_table(self, keep_cursor: int = 0) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        table.clear()
+        for i, rule in enumerate(self.config["rules"], 1):
+            table.add_row(
+                str(i),
+                rule.get("pattern", ""),
+                rule.get("type", "glob"),
+                rule.get("browser", ""),
+            )
+        if self.config["rules"]:
+            row = min(keep_cursor, len(self.config["rules"]) - 1)
+            table.move_cursor(row=row)
+
+    @on(Select.Changed, "#default-select")
+    def on_default_changed(self, event: Select.Changed) -> None:
+        if event.value is not Select.BLANK:
+            self.config["default_browser"] = str(event.value)
+            save_config(self.config)
+
+    def action_add_rule(self) -> None:
+        def handle(rule: Optional[dict]) -> None:
+            if rule:
+                self.config["rules"].append(rule)
+                save_config(self.config)
+                self._refresh_table(keep_cursor=len(self.config["rules"]) - 1)
+
+        self.push_screen(RuleEditScreen(browsers=self.browsers), handle)
+
+    def action_edit_rule(self) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        idx = table.cursor_row
+        if idx < 0 or idx >= len(self.config["rules"]):
+            return
+
+        def handle(rule: Optional[dict]) -> None:
+            if rule:
+                self.config["rules"][idx] = rule
+                save_config(self.config)
+                self._refresh_table(keep_cursor=idx)
+
+        self.push_screen(
+            RuleEditScreen(rule=self.config["rules"][idx], browsers=self.browsers),
+            handle,
+        )
+
+    def action_delete_rule(self) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        idx = table.cursor_row
+        if idx < 0 or idx >= len(self.config["rules"]):
+            return
+
+        rule = self.config["rules"][idx]
+
+        def handle(confirmed: bool) -> None:
+            if confirmed:
+                self.config["rules"].pop(idx)
+                save_config(self.config)
+                self._refresh_table(keep_cursor=max(0, idx - 1))
+
+        self.push_screen(
+            ConfirmScreen(f"Delete rule '{rule.get('pattern')} → {rule.get('browser')}'?"),
+            handle,
+        )
+
+    def action_move_up(self) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        idx = table.cursor_row
+        if idx <= 0:
+            return
+        rules = self.config["rules"]
+        rules[idx], rules[idx - 1] = rules[idx - 1], rules[idx]
+        save_config(self.config)
+        self._refresh_table(keep_cursor=idx - 1)
+
+    def action_move_down(self) -> None:
+        table = self.query_one("#rules-table", DataTable)
+        idx = table.cursor_row
+        if idx >= len(self.config["rules"]) - 1:
+            return
+        rules = self.config["rules"]
+        rules[idx], rules[idx + 1] = rules[idx + 1], rules[idx]
+        save_config(self.config)
+        self._refresh_table(keep_cursor=idx + 1)
+
+    def action_test_url(self) -> None:
+        self.push_screen(TestURLScreen(self.config, self.browsers))
+
+    def action_install(self) -> None:
+        def handle(confirmed: bool) -> None:
+            if confirmed:
+                try:
+                    install_as_default()
+                    self.query_one("#status-label", Static).update(self._status_text())
+                    self.notify("Installed as default browser.")
+                except Exception as e:
+                    self.notify(f"Install failed: {e}", severity="error")
+
+        self.push_screen(
+            ConfirmScreen("Install Browser Dispatch as the system default browser?"),
+            handle,
+        )
+
+    def action_uninstall(self) -> None:
+        if not is_installed():
+            self.notify("Not currently installed as default browser.", severity="warning")
+            return
+
+        def handle(confirmed: bool) -> None:
+            if confirmed:
+                try:
+                    uninstall_as_default()
+                    self.query_one("#status-label", Static).update(self._status_text())
+                    self.notify("Uninstalled. Previous browser restored.")
+                except Exception as e:
+                    self.notify(f"Uninstall failed: {e}", severity="error")
+
+        self.push_screen(
+            ConfirmScreen(
+                "Uninstall Browser Dispatch and restore the previous default browser?"
+            ),
+            handle,
+        )
+
+    def action_quit_app(self) -> None:
+        self.exit()
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print("Browser Dispatch — smart URL-to-browser router for Linux")
+        print()
+        print("Usage:")
+        print("  browser-dispatch --config          Open configuration TUI")
+        print("  browser-dispatch <url>             Dispatch URL to configured browser")
+        print()
+        print(f"Config file : {CONFIG_PATH}")
+        print(f"Desktop file: {DESKTOP_FILE_PATH}")
+        return
+
+    first = args[0]
+
+    if first in ("--config", "-c", "config"):
+        app = BrowserDispatchApp()
+        app.run()
+        return
+
+    if first.startswith(("http://", "https://", "ftp://", "file://")):
+        dispatch(first)
+        return
+
+    print(f"browser-dispatch: unrecognised argument: {first!r}", file=sys.stderr)
+    print("Run with --help for usage.", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
