@@ -4,7 +4,7 @@ A smart browser dispatcher for Linux. Route URLs to different browsers based on 
 
 Configured through an interactive terminal UI built with [Textual](https://github.com/Textualize/textual).
 
-![Browser Dispatch TUI](https://raw.githubusercontent.com/Elwimen/browser-dispatch/main/screenshot.png)
+![Browser Dispatch TUI](https://raw.githubusercontent.com/Elwimen/browser-dispatch/main/screenshot.svg)
 
 ## Features
 
