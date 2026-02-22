@@ -262,7 +262,9 @@ def is_installed() -> bool:
 
 
 def _read_mimeapps() -> configparser.RawConfigParser:
-    cp = configparser.RawConfigParser()
+    # strict=False: mimeapps.list can have duplicate keys (e.g. written by
+    # different tools with/without spaces around =); we just keep the last value.
+    cp = configparser.RawConfigParser(strict=False)
     cp.optionxform = str
     if MIMEAPPS_PATH.exists():
         cp.read(str(MIMEAPPS_PATH), encoding="utf-8")
