@@ -250,7 +250,7 @@ def dispatch(url: str) -> None:
         )
         sys.exit(1)
 
-    subprocess.Popen(cmd)
+    subprocess.Popen(cmd, start_new_session=True)
 
 
 # =============================================================================
